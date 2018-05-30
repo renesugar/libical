@@ -384,6 +384,10 @@ static void icalrecur_clause_name_and_value(struct icalrecur_parser *parser,
     *value = idx;
 }
 
+/* returns < 0 if a parsing problem:
+   -2 if an RSCALE rule is encountered yet we don't RSCALE support enabled
+   -1 for all other parsing problems
+*/
 static int icalrecur_add_byrules(struct icalrecur_parser *parser, short *array,
                                  int min, int size, char *vals)
 {
@@ -426,11 +430,14 @@ static int icalrecur_add_byrules(struct icalrecur_parser *parser, short *array,
 
         if (*t) {
             /* Check for leap month suffix (RSCALE only) */
-            if (icalrecurrencetype_rscale_is_supported() &&
-                array == parser->rt.by_month && strcmp(t, "L") == 0) {
-                /* The "L" suffix in a BYMONTH recur-rule-part
-                   is encoded by setting a high-order bit */
-                v |= LEAP_MONTH;
+            if (array == parser->rt.by_month && strcmp(t, "L") == 0) {
+                if (icalrecurrencetype_rscale_is_supported()) {
+                    /* The "L" suffix in a BYMONTH recur-rule-part
+                       is encoded by setting a high-order bit */
+                    v |= LEAP_MONTH;
+                } else {
+                    return -2;
+                }
             } else {
                 return -1;
             }
@@ -531,7 +538,7 @@ static int icalrecur_add_bydayrules(struct icalrecur_parser *parser,
             return -1;
         }
 
-        array[i++] = (short)(sign * (wd + 8 * weekno));
+        array[i++] = icalrecurrencetype_encode_day(wd, sign * weekno);
         array[i] = ICAL_RECURRENCE_ARRAY_MAX;
     }
 
@@ -582,14 +589,24 @@ struct icalrecurrencetype icalrecurrencetype_from_string(const char *str)
             }
         } else if (strcasecmp(name, "FREQ") == 0) {
             parser.rt.freq = icalrecur_string_to_freq(value);
-            if (parser.rt.freq == ICAL_NO_RECURRENCE) r = -1;
-        } else if (icalrecurrencetype_rscale_is_supported() &&
-                   strcasecmp(name, "RSCALE") == 0) {
-            parser.rt.rscale = icalmemory_strdup(value);
-        } else if (icalrecurrencetype_rscale_is_supported() &&
-                   strcasecmp(name, "SKIP") == 0) {
-            parser.rt.skip = icalrecur_string_to_skip(value);
-            if (parser.rt.skip == ICAL_SKIP_UNDEFINED) r = -1;
+            if (parser.rt.freq == ICAL_NO_RECURRENCE) {
+                r = -1;
+            }
+        } else if (strcasecmp(name, "RSCALE") == 0) {
+            if (icalrecurrencetype_rscale_is_supported()) {
+                parser.rt.rscale = icalmemory_strdup(value);
+            } else {
+                r = -2; // RSCALE clause name without RSCALE support
+            }
+        } else if (strcasecmp(name, "SKIP") == 0) {
+            if (icalrecurrencetype_rscale_is_supported()) {
+                parser.rt.skip = icalrecur_string_to_skip(value);
+                if (parser.rt.skip == ICAL_SKIP_UNDEFINED) {
+                    r = -1;
+                }
+            } else {
+                r = -2; // RSCALE clause name without RSCALE support
+            }
         } else if (strcasecmp(name, "COUNT") == 0) {
             parser.rt.count = atoi(value);
             /* don't allow count to be less than 1 */
@@ -640,8 +657,15 @@ struct icalrecurrencetype icalrecurrencetype_from_string(const char *str)
         }
 
         if (r) {
-            icalerror_set_errno(ICAL_MALFORMEDDATA_ERROR);
-            free(parser.rt.rscale);
+            /* Note: silently ignore when we have an RSCALE rule, yet don't have RSCALE support.
+               The magic value "-2" indicates when that happens.
+            */
+            if (r != -2) {
+                icalerror_set_errno(ICAL_MALFORMEDDATA_ERROR);
+            }
+            if (parser.rt.rscale) {
+                free(parser.rt.rscale);
+            }
             icalrecurrencetype_clear(&parser.rt);
             break;
         }
@@ -829,6 +853,7 @@ struct icalrecur_iterator_impl
 
     struct icaltimetype rstart;      /* DTSTART in RSCALE  */
     struct icaltimetype istart;      /* Gregorian start time for iterator */
+    struct icaltimetype iend;        /* Gregorian end time for iterator */
     struct icaltimetype last;        /* last time returned from iterator */
     int occurrence_no;               /* number of steps made on the iterator */
 
@@ -1832,6 +1857,7 @@ icalrecur_iterator *icalrecur_iterator_new(struct icalrecurrencetype rule,
 
     impl->dtstart = dtstart;
     impl->rule = rule;
+    impl->iend = icaltime_null_time();
 
     /* Set up convenience pointers to make the code simpler. Allows
        us to iterate through all of the BY* arrays in the rule. */
@@ -1950,31 +1976,23 @@ static int __day_diff(icalrecur_iterator *impl, icaltimetype a, icaltimetype b)
    available. */
 static void increment_month(icalrecur_iterator *impl)
 {
+    int inc = impl->rule.interval;
+
+    __increment_month(impl, inc);
+
     if (has_by_data(impl, BY_MONTH)) {
-        /* Ignore the frequency and use the byrule data */
+        struct icaltimetype this = occurrence_as_icaltime(impl, 0);
 
-        do {
-            BYMONIDX++;
+        while (this.year < 20000) {
+            for (BYMONIDX = 0;
+                 BYMONPTR[BYMONIDX] != ICAL_RECURRENCE_ARRAY_MAX; BYMONIDX++) {
 
-            if (BYMONPTR[BYMONIDX] == ICAL_RECURRENCE_ARRAY_MAX) {
-                BYMONIDX = 0;
-
-                increment_year(impl, 1);
+                if (this.month == BYMONPTR[BYMONIDX]) return;
             }
 
-        } while (!set_month(impl, BYMONPTR[BYMONIDX]));
-
-    } else {
-
-        int inc;
-
-        if (impl->rule.freq == ICAL_MONTHLY_RECURRENCE) {
-            inc = impl->rule.interval;
-        } else {
-            inc = 1;
+            __increment_month(impl, inc);
+            this = occurrence_as_icaltime(impl, 0);
         }
-
-        __increment_month(impl, inc);
     }
 }
 
@@ -2819,6 +2837,9 @@ struct icaltimetype icalrecur_iterator_next(icalrecur_iterator *impl)
             return icaltime_null_time();
         }
 
+        if ((!icaltime_is_null_time(impl->iend)) && (icaltime_compare(impl->last, impl->iend) >= 0))
+            return icaltime_null_time();
+
     } while (icaltime_compare(impl->last, impl->istart) < 0 ||
              !check_contracting_rules(impl));
 
@@ -2979,6 +3000,17 @@ int icalrecur_iterator_set_start(icalrecur_iterator *impl,
     return __iterator_set_start(impl, start);
 }
 
+int icalrecur_iterator_set_end(icalrecur_iterator *impl,
+    struct icaltimetype end)
+{
+    /* Convert end to same time zone as DTSTART */
+    end = icaltime_convert_to_zone(end, (icaltimezone *)impl->dtstart.zone);
+
+    impl->iend = end;
+
+    return 1;
+}
+
 /************************** Type Routines **********************/
 
 void icalrecurrencetype_clear(struct icalrecurrencetype *recur)
@@ -3022,6 +3054,11 @@ int icalrecurrencetype_day_position(short day)
     return pos;
 }
 
+short icalrecurrencetype_encode_day(enum icalrecurrencetype_weekday weekday, int position)
+{
+    return (weekday + (8 * abs(position))) * ((position < 0) ? -1 : 1);
+}
+
 /**
  * The 'month' element of the by_month array is encoded to allow
  * representation of the "L" leap suffix (RFC 7529).
@@ -3038,6 +3075,11 @@ int icalrecurrencetype_month_is_leap(short month)
 int icalrecurrencetype_month_month(short month)
 {
     return (month & ~LEAP_MONTH);
+}
+
+short icalrecurrencetype_encode_month(int month, int is_leap)
+{
+    return month | (is_leap ? LEAP_MONTH : 0);
 }
 
 /** Fill an array with the 'count' number of occurrences generated by
@@ -3074,7 +3116,8 @@ int icalrecur_expand_recurrence(const char *rule,
         }
         icalrecur_iterator_free(ritr);
     }
-    free(recur.rscale);
+    if(recur.rscale)
+        free(recur.rscale);
 
     return 1;
 }

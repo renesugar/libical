@@ -476,7 +476,7 @@ static char *parser_get_next_parameter(char *line, char **end)
  * Get a single property line, from the property name through the
  * final new line, and include any continuation lines
  */
-char *icalparser_get_line(icalparser *parser, 
+char *icalparser_get_line(icalparser *parser,
                           icalparser_line_gen_func line_gen_func)
 {
     char *line;
@@ -1273,6 +1273,13 @@ char *icalparser_string_line_generator(char *out, size_t buf_size, void *d)
 
     if (data->pos == 0) {
         data->pos = data->str;
+
+        /* Skip the UTF-8 marker at the beginning of the string */
+        if (((unsigned char) data->pos[0]) == 0xEF &&
+            ((unsigned char) data->pos[1]) == 0xBB &&
+            ((unsigned char) data->pos[2]) == 0xBF) {
+            data->pos += 3;
+        }
     }
 
     /* If the pointer is at the end of the string, we are done */
